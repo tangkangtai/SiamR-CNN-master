@@ -38,6 +38,8 @@ def fpn_model(features):
     # GroupNorm
     use_gn = cfg.FPN.NORM == 'GN'
 
+    # 向上采样//也就是特征图的增大
+    # //采用最近邻插值法
     def upsample2x(name, x):
         # FixedUnPooling(x, shape, unpool_mat=None, data_format='channels_last')
         # 用一个固定矩阵对输入进行解池，以执行kronecker(克罗内克内积 )乘积。
@@ -70,7 +72,7 @@ def fpn_model(features):
         #         #         padding='same',
         #         #         )
 
-        # 经过卷积之后的 特征图
+        # 经过卷积之后的 特征图                         i+2 = 2,3,4,5                        features :([tf.Tensor]): ResNet features c2-c5
         lat_2345 = [Conv2D('lateral_1x1_c{}'.format(i + 2), c, num_channel, 1) for i, c in enumerate(features)]
 
         if use_gn:
@@ -78,7 +80,7 @@ def fpn_model(features):
             lat_2345 = [GroupNorm('gn_c{}'.format(i + 2), c) for i, c in enumerate(lat_2345)]
 
         lat_sum_5432 = []
-
+        # p6,p5,p4,p3,p2
         for idx, lat in enumerate(lat_2345[::-1]):
             if idx == 0:
                 lat_sum_5432.append(lat)
@@ -86,10 +88,17 @@ def fpn_model(features):
                 lat = lat + upsample2x('upsample_lat{}'.format(6 - idx), lat_sum_5432[-1])
 
                 lat_sum_5432.append(lat)
-        p2345 = [Conv2D('posthoc_3x3_p{}'.format(i + 2), c, num_channel, 3)
-                 for i, c in enumerate(lat_sum_5432[::-1])]
+        # C5层先经过1 x 1卷积，改变特征图的通道数(文章中设置d=256，与Faster R-CNN中RPN层的维数相同便于分类与回归)。
+        # M5通过上采样，再加上(特征图中每一个相同位置元素直接相加)C4经过1 x 1卷积后的特征图，得到M4。
+        # 这个过程再做两次，分别得到M3，M2。M层特征图再经过3 x 3卷积(减轻最近邻近插值带来的混叠影响，周围的数都相同)，得到最终的P2，P3，P4，P5层特征。
+        #
+        # 另外，和传统的图像金字塔方式一样，所有M层的通道数都设计成一样的，本文都用d=256。
+        # https: // zhuanlan.zhihu.com / p / 92005927
+        p2345 = [Conv2D('posthoc_3x3_p{}'.format(i + 2), c, num_channel, 3) for i, c in enumerate(lat_sum_5432[::-1])]
+
         if use_gn:
             p2345 = [GroupNorm('gn_p{}'.format(i + 2), c) for i, c in enumerate(p2345)]
+        # p6是p5降采样,stride=2
         p6 = MaxPooling('maxpool_p6', p2345[-1], pool_size=1, strides=2, data_format='channels_first', padding='VALID')
 
         return p2345 + [p6]
@@ -109,23 +118,34 @@ def fpn_map_rois_to_levels(boxes):
 
     Be careful that the returned tensor could be empty.
     """
+    # boxes 面积的平方根
     sqrtarea = tf.sqrt(tf_area(boxes))
-    level = tf.cast(tf.floor(
-        4 + tf.log(sqrtarea * (1. / 224) + 1e-6) * (1.0 / np.log(2))), tf.int32)
+    # Fast R-CNN通常在单尺度特征映射上执行。要将其与我们的FPN一起使用，我们需要为金字塔等级分配不同尺度的RoI。
+    # ROI Pooling层使用region proposal的结果和中间的某一特征图作为输入，得到的结果经过分解后分别用于分类结果和边框回归。
+
+    # 然后作者想的是，不同尺度的ROI使用不同特征层作为ROI pooling层的输入，大尺度ROI就用后面一些的金字塔层，比如P5；小尺度ROI就用前面一点的特征层，比如P4。
+    # ————————————————
+    # 版权声明：本文为CSDN博主「不一样的等待12305」的原创文章，遵循CC 4.0 BY-SA版权协议，转载请附上原文出处链接及本声明。
+    # 原文链接：https://blog.csdn.net/qq_39068872/article/details/100519612
+    level = tf.cast(tf.floor(4 + tf.log(sqrtarea * (1. / 224) + 1e-6) * (1.0 / np.log(2))), tf.int32)
 
     # RoI levels range from 2~5 (not 6)
     level_ids = [
+        # tf.where(condition,x=None,y=None)时，返回满足condition条件的坐标
         tf.where(level <= 2),
         tf.where(tf.equal(level, 3)),   # == is not supported
-        tf.where(tf.equal(level, 4)),
+        tf.where(tf.equal(level, 4)),   # tf.equal(x,y,name=None) 返回(x==y)元素的真值
         tf.where(level >= 5)]
-    level_ids = [tf.reshape(x, [-1], name='roi_level{}_id'.format(i + 2))
-                 for i, x in enumerate(level_ids)]
-    num_in_levels = [tf.size(x, name='num_roi_level{}'.format(i + 2))
-                     for i, x in enumerate(level_ids)]
+    #  tf.reshape(tensor,shape),shape=[-1]时 既平铺成1-D向量
+    level_ids = [tf.reshape(x, [-1], name='roi_level{}_id'.format(i + 2)) for i, x in enumerate(level_ids)]
+
+    num_in_levels = [tf.size(x, name='num_roi_level{}'.format(i + 2)) for i, x in enumerate(level_ids)]
+
     add_moving_summary(*num_in_levels)
 
+    # tf.gather(params, indices,...aixs=0) 根据索引从参数轴上收集切片,默认axis=0
     level_boxes = [tf.gather(boxes, ids) for ids in level_ids]
+
     return level_ids, level_boxes
 
 
@@ -134,28 +154,40 @@ def multilevel_roi_align(features, rcnn_boxes, resolution):
     """
     Args:
         features ([tf.Tensor]): 4 FPN feature level 2-5
+
         rcnn_boxes (tf.Tensor): nx4 boxes
+
         resolution (int): output spatial resolution
     Returns:
         NxC x res x res
     """
     assert len(features) == 4, features
+
     # Reassign rcnn_boxes to levels
     level_ids, level_boxes = fpn_map_rois_to_levels(rcnn_boxes)
+
     all_rois = []
 
     # Crop patches from corresponding levels
     for i, boxes, featuremap in zip(itertools.count(), level_boxes, features):
+
         with tf.name_scope('roi_level{}'.format(i + 2)):
             boxes_on_featuremap = boxes * (1.0 / cfg.FPN.ANCHOR_STRIDES[i])
             all_rois.append(roi_align(featuremap, boxes_on_featuremap, resolution))
 
     # this can fail if using TF<=1.8 with MKL build
     all_rois = tf.concat(all_rois, axis=0)  # NCHW
+
     # Unshuffle to the original order, to match the original samples
-    level_id_perm = tf.concat(level_ids, axis=0)  # A permutation of 1~N
+    # 恢复原始顺序，去匹配原始的样本
+    level_id_perm = tf.concat(level_ids, axis=0)  # A permutation(排列) of 1~N
+
+    # tf.invert_permutation   y[x[i]] = i for i in [0, 1, ..., len(x) - 1]
     level_id_invert_perm = tf.invert_permutation(level_id_perm)
+
+    #  # tf.gather(params, indices,...aixs=0) 根据索引从参数轴上收集切片,默认axis=0
     all_rois = tf.gather(all_rois, level_id_invert_perm)
+
     return all_rois
 
 
@@ -165,26 +197,35 @@ def neck_roi_align(features, rcnn_boxes, resolution):
     Args:
         features ([tf.Tensor]): 4 FPN feature level 2-5
         rcnn_boxes (tf.Tensor): nx4 boxes
+
         resolution (int): output spatial resolution
     Returns:
         NxC x res x res
     """
     assert len(features) == 4, features
     aligned_features = None
+
     for i in range(4):
+                                    # 2, 3, 4, 5
         with tf.name_scope('roi_level{}'.format(i + 2)):
+            # _C.FPN.ANCHOR_STRIDES = (4, 8, 16, 32, 64)
+            # strides for each FPN level. Must be the same length as ANCHOR_SIZES
             boxes_on_featuremap = rcnn_boxes * (1.0 / cfg.FPN.ANCHOR_STRIDES[i])
+
             level_features = roi_align(features[i], boxes_on_featuremap, resolution)
+
             if aligned_features is None:
                 aligned_features = level_features
             else:
                 aligned_features += level_features
+
     return aligned_features
 
 
 def multilevel_rpn_losses(
         multilevel_anchors, multilevel_label_logits, multilevel_box_logits):
     """
+    # logits 就是最终的全连接层的输出
     Args:
         multilevel_anchors: #lvl RPNAnchors
         multilevel_label_logits: #lvl tensors of shape HxWxA
@@ -193,6 +234,7 @@ def multilevel_rpn_losses(
     Returns:
         label_loss, box_loss
     """
+    # _C.FPN.ANCHOR_STRIDES = (4, 8, 16, 32, 64)  # strides for each FPN level. Must be the same length as ANCHOR_SIZES
     num_lvl = len(cfg.FPN.ANCHOR_STRIDES)
     assert len(multilevel_anchors) == num_lvl
     assert len(multilevel_label_logits) == num_lvl
@@ -202,15 +244,17 @@ def multilevel_rpn_losses(
     with tf.name_scope('rpn_losses'):
         for lvl in range(num_lvl):
             anchors = multilevel_anchors[lvl]
+
             label_loss, box_loss = rpn_losses(
                 anchors.gt_labels, anchors.encoded_gt_boxes(),
                 multilevel_label_logits[lvl], multilevel_box_logits[lvl],
                 name_scope='level{}'.format(lvl + 2))
             losses.extend([label_loss, box_loss])
-
+        # tf.add_n([p1, p2, p3....])函数是实现一个列表的元素的相加
         total_label_loss = tf.add_n(losses[::2], name='label_loss')
         total_box_loss = tf.add_n(losses[1::2], name='box_loss')
         add_moving_summary(total_label_loss, total_box_loss)
+
     return [total_label_loss, total_box_loss]
 
 
@@ -266,5 +310,4 @@ def generate_fpn_proposals(
             cfg.RPN.TRAIN_POST_NMS_TOPK if training else cfg.RPN.TEST_POST_NMS_TOPK)
 
     tf.sigmoid(proposal_scores, name='probs')  # for visualization
-    return tf.stop_gradient(proposal_boxes, name='boxes'), \
-        tf.stop_gradient(proposal_scores, name='scores')
+    return tf.stop_gradient(proposal_boxes, name='boxes'), tf.stop_gradient(proposal_scores, name='scores')

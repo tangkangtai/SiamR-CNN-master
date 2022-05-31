@@ -52,10 +52,12 @@ def rpn_losses(anchor_labels, anchor_boxes, label_logits, box_logits):
         valid_mask = tf.stop_gradient(tf.not_equal(anchor_labels, -1))
         pos_mask = tf.stop_gradient(tf.equal(anchor_labels, 1))
         nr_valid = tf.stop_gradient(tf.count_nonzero(valid_mask, dtype=tf.int32), name='num_valid_anchor')
+
         nr_pos = tf.identity(tf.count_nonzero(pos_mask, dtype=tf.int32), name='num_pos_anchor')
         # nr_pos is guaranteed >0 in C4. But in FPN. even nr_valid could be 0.
 
         valid_anchor_labels = tf.boolean_mask(anchor_labels, valid_mask)
+
     valid_label_logits = tf.boolean_mask(label_logits, valid_mask)
 
     with tf.name_scope('label_metrics'):

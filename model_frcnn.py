@@ -22,14 +22,24 @@ def proposal_metrics(iou):
     Add summaries for RPN proposals.
 
     Args:
-        iou: nxm, #proposal x #gt
+        iou: nxm, # proposal x #gt
     """
     # find best roi for each gt, for summary only
+
+    # tf.reduce_max(input_tensor,aixs=None)计算一个张量的各个维度上元素的最大值
     best_iou = tf.reduce_max(iou, axis=0)
+
+    # tf.reduce_mean(input_tensor,axis=None...)计算张量的各个维度上的元素的平均值
+    # 如果axis没有条目,则减少所有维度,并返回具有单个元素的张量
+
     mean_best_iou = tf.reduce_mean(best_iou, name='best_iou_per_gt')
+
     summaries = [mean_best_iou]
+
     with tf.device('/cpu:0'):
+
         for th in [0.3, 0.5]:
+
             recall = tf.truediv(
                 tf.count_nonzero(best_iou >= th),
                 tf.size(best_iou, out_type=tf.int64),
